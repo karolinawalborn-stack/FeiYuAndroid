@@ -55,6 +55,8 @@ fun AvatarStage(
     onTouch: (String) -> Unit,
     onStatus: (StageStatus) -> Unit,
     modifier: Modifier = Modifier,
+    /** File name of an imported .model3.json (files/models/custom), or null for 大肥鱼. */
+    modelFile: String? = null,
 ) {
     val context = LocalContext.current
     val touch by rememberUpdatedState(onTouch)
@@ -65,7 +67,7 @@ fun AvatarStage(
     AndroidView(
         modifier = modifier,
         factory = { ctx ->
-            createStage(ctx,
+            createStage(ctx, modelFile,
                 onReady = { ok -> ready = ok; status(if (ok) StageStatus.READY else StageStatus.FAILED) },
                 onTouch = { zone -> touch(zone) },
             ).also { web = it }
@@ -104,9 +106,12 @@ fun AvatarStage(
 }
 
 @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
-private fun createStage(context: Context, onReady: (Boolean) -> Unit, onTouch: (String) -> Unit): WebView {
+private fun createStage(context: Context, modelFile: String?, onReady: (Boolean) -> Unit, onTouch: (String) -> Unit): WebView {
     val main = Handler(Looper.getMainLooper())
+    val models = java.io.File(context.filesDir, "models").apply { mkdirs() }
+    // Imported models are served from app storage at the path stage.js expects (../Models/<id>/<file>).
     val loader = WebViewAssetLoader.Builder()
+        .addPathHandler("/assets/Models/", WebViewAssetLoader.InternalStoragePathHandler(context, models))
         .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(context))
         .build()
     return WebView(context).apply {
@@ -146,7 +151,11 @@ private fun createStage(context: Context, onReady: (Boolean) -> Unit, onTouch: (
                 return true
             }
         }
-        loadUrl("https://appassets.androidplatform.net/assets/AvatarStage/index.html")
+        val address = android.net.Uri.parse("https://appassets.androidplatform.net/assets/AvatarStage/index.html").buildUpon()
+        if (modelFile != null && modelFile.endsWith(".model3.json") && !modelFile.contains('/')) {
+            address.appendQueryParameter("model", ModelLibrary.ID).appendQueryParameter("file", modelFile)
+        }
+        loadUrl(address.build().toString())
     }
 }
 

@@ -44,6 +44,15 @@ class CompanionModel(app: Application) : AndroidViewModel(app) {
     var quietTurn by mutableStateOf(false); private set
     var typing by mutableStateOf(false)
 
+    val stickerStore = StickerStore(store.stickersDir, store.prefs)
+    var stickers by mutableStateOf(stickerStore.load()); private set
+    var album by mutableStateOf(store.album); private set
+    var modelInfo by mutableStateOf(ModelLibrary.info(store.modelsDir)); private set
+    /** Bumped after a model import so the stage reloads. */
+    var stageVersion by mutableIntStateOf(0); private set
+    var syncing by mutableStateOf(false); private set
+    var dshSession by mutableStateOf(store.dshSession); private set
+
     private var task: Job? = null
     private var speech: SpeechPipeline? = null
     private var requestId: String? = null
@@ -276,6 +285,8 @@ class CompanionModel(app: Application) : AndroidViewModel(app) {
     fun clearChat() {
         cancel()
         conversation.messages.mapNotNull { it.audioFile }.forEach { store.audioFile(it).delete() }
+        val kept = album.map { it.path }.toSet()
+        conversation.messages.flatMap { it.images }.filter { it.path !in kept }.forEach { image -> store.mediaFile(image.path)?.delete() }
         saveConversation(conversation.copy(messages = emptyList(), summary = null))
     }
 
@@ -320,28 +331,59 @@ class CompanionModel(app: Application) : AndroidViewModel(app) {
         preview = ""
     }
 
-    fun send(value: String, readAloud: Boolean = false, record: Boolean = true, quiet: Boolean = false): Boolean {
+    fun send(
+        value: String,
+        readAloud: Boolean = false,
+        record: Boolean = true,
+        quiet: Boolean = false,
+        images: List<MessageImage> = emptyList(),
+        stickerId: String? = null,
+        generateImage: Boolean = false,
+    ): Boolean {
         val text = value.trim()
-        if (pending || text.isEmpty()) return false
-        quietTurn = quiet
+        if (pending || (text.isEmpty() && images.isEmpty() && stickerId == null)) return false
         val options = settings
+        if (images.isNotEmpty() && (options.provider != TextProvider.RELAY || options.visionModel.isBlank())) {
+            error = "发图前，请在设置中选择自定义中转站并填写视觉模型 ID。"
+            return false
+        }
+        quietTurn = quiet
         val character = persona
         error = null
         player.stop()
         expression = ""
+        val input = ChatMessage(role = "user", text = text, images = images, stickerId = stickerId)
         var current = conversation
         if (record) {
-            current = current.copy(messages = current.messages + ChatMessage(role = "user", text = text))
+            current = current.copy(messages = current.messages + input)
             saveConversation(current)
         }
         // Touch / greeting prompts guide the model but never appear in the chat.
-        val request = if (record) current else current.copy(messages = current.messages + ChatMessage(role = "user", text = text))
+        val request = if (record) current else current.copy(messages = current.messages + input)
         val id = newId()
         requestId = id
         pending = true
         activity = "正在思考回复"
+        // DSH mode: what you type goes to DeepSeek Harness on your computer. Touches, greetings
+        // and pictures keep using her normal persona.
+        if (options.dshEnabled && record && images.isEmpty() && stickerId == null && !generateImage && text.isNotEmpty()) {
+            runDsh(text, id, readAloud, options)
+            return true
+        }
         val textKey = key(options.provider.keyName)
         val voiceKey = key(options.voiceProvider.keyName)
+        // Sticker frequency: offer the pack only when enough replies have passed since her last sticker.
+        val every = options.stickerEvery
+        val sinceSticker = store.stickerTurns
+        val stickerChoices = if (every > 0 && sinceSticker + 1 >= every && stickers.isNotEmpty()) StickerStore.promptList(stickers) else emptyList()
+        val albumNow = album.takeLast(30).filter { store.mediaFile(it.path)?.exists() == true }
+        val pictures = if (images.isEmpty()) emptyMap() else
+            mapOf(input.id to images.mapNotNull { image -> store.mediaFile(image.path)?.takeIf { it.exists() }?.readBytes() })
+        if (images.isNotEmpty() && pictures[input.id].orEmpty().size != images.size) {
+            pending = false; requestId = null; activity = ""
+            error = "部分图片无法读取。"
+            return false
+        }
         val pipeline: SpeechPipeline? = if (readAloud || (options.autoVoice && voiceKey.isNotEmpty())) {
             runCatching { SpeechPipeline(viewModelScope, player, voiceTarget(), voiceKey, store.audioDir) }
                 .onFailure { error = it.message }.getOrNull()
@@ -361,14 +403,27 @@ class CompanionModel(app: Application) : AndroidViewModel(app) {
                         withContext(Dispatchers.Main) {
                             if (requestId == id) { pipeline?.setEmotion(mood); showEmotion(mood) }
                         }
-                    })
+                    },
+                    stickers = stickerChoices,
+                    albumIds = albumNow.map { it.id + (it.altText?.let { alt -> ": $alt" } ?: "") },
+                    pictures = pictures,
+                    allowImageGeneration = generateImage)
                 if (requestId != id) { pipeline?.cancel(); return@launch }
                 preview = ""
                 showEmotion(reply.emotion)
                 val extras = reply.bubbles.take(2).map(ReplyText::cleanNarration).filter { it.isNotEmpty() }
                 val lines = (listOf(reply.text) + extras).filter { it.isNotEmpty() }
-                if (lines.isEmpty()) throw AppException("角色没有返回可显示的内容。")
-                val bubbles = lines.map { ChatMessage(role = "assistant", text = it, emotion = reply.emotion) }
+                var sticker = if (stickerChoices.isEmpty()) null else StickerStore.resolve(stickers, reply.sticker)
+                // Models often skip optional fields: on a sticker turn, pick one that matches her emotion.
+                if (sticker == null && stickerChoices.isNotEmpty() && reply.emotion != "sad") sticker = StickerStore.fallback(stickers, reply.emotion)
+                if (stickerChoices.isNotEmpty() || every > 0) store.stickerTurns = if (sticker == null) minOf(99, sinceSticker + 1) else 0
+                val photo = albumNow.firstOrNull { it.id == reply.imageId }
+                if (lines.isEmpty() && sticker == null && photo == null && !generateImage) throw AppException("角色没有返回可显示的内容。")
+                val bubbles = lines.map { ChatMessage(role = "assistant", text = it, emotion = reply.emotion) }.toMutableList()
+                if (sticker != null || photo != null) {
+                    bubbles.add(ChatMessage(role = "assistant", text = "", emotion = reply.emotion,
+                        images = listOfNotNull(photo), stickerId = sticker?.id))
+                }
                 var updated = conversation.copy(messages = conversation.messages + bubbles)
                 if (options.autoMemory && record) {
                     updated = updated.withAutomaticMemories(reply.memories)
@@ -377,15 +432,30 @@ class CompanionModel(app: Application) : AndroidViewModel(app) {
                 if (record) updated = updated.copy(affinity = minOf(100, updated.affinity + 1))
                 saveConversation(updated)
                 if (pipeline != null) {
-                    if (!pipeline.started) activity = "语音生成中…"
-                    pipeline.setEmotion(reply.emotion ?: "neutral")
-                    pipeline.finish(pipeline.lastText.ifEmpty { reply.text }, extras)
+                    if (lines.isEmpty()) pipeline.cancel()
+                    else {
+                        if (!pipeline.started) activity = "语音生成中…"
+                        pipeline.setEmotion(reply.emotion ?: "neutral")
+                        pipeline.finish(pipeline.lastText.ifEmpty { reply.text }, extras)
+                    }
+                }
+                if (generateImage) {
+                    activity = "正在生成图片"
+                    val prompt = reply.imagePrompt?.trim().orEmpty().ifEmpty { text }
+                    val bytes = ChatApi.generateImage(options, key("relay"), prompt)
+                    if (requestId != id) return@launch
+                    val image = withContext(Dispatchers.IO) { Media.saveImage(bytes, store.mediaDir) }
+                    saveConversation(conversation.copy(messages = conversation.messages +
+                        ChatMessage(role = "assistant", text = "", images = listOf(image))))
+                }
+                if (pipeline != null && lines.isNotEmpty()) {
                     val saved = pipeline.await()
                     if (requestId != id) return@launch
                     if (saved != null) {
                         val firstId = bubbles.first().id
+                        val seconds = (saved.length() - 44) / 48_000.0
                         saveConversation(conversation.copy(messages = conversation.messages.map {
-                            if (it.id == firstId) it.copy(audioFile = saved.name) else it
+                            if (it.id == firstId) it.copy(audioFile = saved.name, audioDuration = seconds) else it
                         }))
                     } else pipeline.error?.let { if (!pipeline.started) throw it }
                     if (pipeline.failedPieces > 0 && pipeline.started) {
@@ -410,6 +480,195 @@ class CompanionModel(app: Application) : AndroidViewModel(app) {
             }
         }
         return true
+    }
+
+    // MARK: - DSH (DeepSeek Harness on your computer)
+
+    private fun runDsh(text: String, id: String, readAloud: Boolean, options: AppSettings) {
+        activity = "DSH 已接到任务…"
+        val token = key(DshBridge.TOKEN_KEY)
+        val session = dshSession
+        task = viewModelScope.launch {
+            var pipeline: SpeechPipeline? = null
+            try {
+                val result = DshBridge.chat(text, options.dshUrl, token, session,
+                    onStatus = { line -> withContext(Dispatchers.Main) { if (requestId == id) activity = line } },
+                    onText = { partial -> withContext(Dispatchers.Main) { if (requestId == id) preview = partial } })
+                if (requestId != id) return@launch
+                result.sessionId?.let { setDshSession(it) }
+                preview = ""
+                val message = ChatMessage(role = "assistant", text = result.text, emotion = "dsh")
+                saveConversation(conversation.copy(messages = conversation.messages + message))
+                val voiceKey = key(options.voiceProvider.keyName)
+                if (!(readAloud || (options.autoVoice && voiceKey.isNotEmpty()))) return@launch
+                val spoken = DshBridge.speakable(result.text)
+                if (spoken.isEmpty()) return@launch
+                pipeline = SpeechPipeline(viewModelScope, player, voiceTarget(), voiceKey, store.audioDir).also { speech = it }
+                activity = "语音生成中…"
+                pipeline.onStart = { if (requestId == id) activity = "正在说话" }
+                pipeline.finish(spoken, emptyList())
+                val saved = pipeline.await()
+                if (requestId != id || saved == null) return@launch
+                saveConversation(conversation.copy(messages = conversation.messages.map {
+                    if (it.id == message.id) it.copy(audioFile = saved.name, audioDuration = (saved.length() - 44) / 48_000.0) else it
+                }))
+            } catch (cancel: CancellationException) {
+                pipeline?.cancel()
+                throw cancel
+            } catch (problem: Throwable) {
+                pipeline?.cancel()
+                if (requestId == id) error = problem.message ?: "DSH 出错了。"
+            } finally {
+                if (requestId == id) {
+                    requestId = null; pending = false; activity = ""; preview = ""; task = null
+                    if (speech === pipeline) speech = null
+                    if (voiceMode) resumeListeningAfterSpeech()
+                }
+            }
+        }
+    }
+
+    fun setDshSession(id: String?) {
+        dshSession = id
+        store.dshSession = id
+    }
+
+    // MARK: - Stickers
+
+    val stickersReady: Boolean get() = stickerStore.builtinReady(stickers)
+
+    fun sticker(id: String?): Sticker? = id?.let { value -> stickers.firstOrNull { it.id == value } }
+
+    fun stickerFile(sticker: Sticker): File = stickerStore.file(sticker)
+
+    fun installBuiltinStickers(made: List<Pair<StickerSpec, ByteArray>>) {
+        runCatching { stickers = stickerStore.installBuiltin(stickers, made) }.onFailure { error = it.message }
+    }
+
+    suspend fun addStickers(uris: List<Uri>): Int {
+        var added = 0
+        for (uri in uris) {
+            val bytes = runCatching { readBytes(uri) }.getOrNull() ?: continue
+            runCatching { withContext(Dispatchers.IO) { stickerStore.addUser(stickers, bytes) } }
+                .onSuccess { stickers = it; added++ }.onFailure { error = it.message }
+        }
+        return added
+    }
+
+    fun renameSticker(sticker: Sticker, title: String) {
+        runCatching { stickers = stickerStore.rename(stickers, sticker, title) }.onFailure { error = it.message }
+    }
+
+    fun deleteSticker(sticker: Sticker) { stickers = stickerStore.delete(stickers, sticker) }
+
+    // MARK: - Pictures and her album
+
+    suspend fun importPhoto(uri: Uri): MessageImage = Media.saveFromUri(getApplication<Application>(), uri, store.mediaDir)
+
+    fun mediaFile(image: MessageImage): File? = store.mediaFile(image.path)
+
+    fun discardPhoto(image: MessageImage) {
+        if (album.none { it.path == image.path }) store.mediaFile(image.path)?.let { Media.forget(it) }
+    }
+
+    suspend fun addAlbumPhotos(uris: List<Uri>) {
+        val added = ArrayList<MessageImage>()
+        for (uri in uris) runCatching { importPhoto(uri) }.onSuccess { added.add(it) }.onFailure { error = it.message }
+        album = album + added
+        store.album = album
+    }
+
+    fun removeAlbumPhoto(image: MessageImage) {
+        album = album.filterNot { it.id == image.id }
+        store.album = album
+        // A photo already sent in the chat still belongs to the history.
+        if (conversation.messages.none { message -> message.images.any { it.path == image.path } }) store.mediaFile(image.path)?.let { Media.forget(it) }
+    }
+
+    fun describeAlbumPhoto(image: MessageImage, description: String) {
+        album = album.map { if (it.id == image.id) it.copy(altText = description.trim().take(80).ifEmpty { null }) else it }
+        store.album = album
+    }
+
+    // MARK: - Imported Live2D model
+
+    val stageModelFile: String? get() = if (settings.useImportedModel) modelInfo?.file else null
+
+    suspend fun installModelFolder(tree: Uri) {
+        modelInfo = ModelLibrary.installFolder(getApplication<Application>(), tree, store.modelsDir)
+        updateSettings { it.copy(useImportedModel = true) }
+        stageVersion++
+    }
+
+    suspend fun installModelZip(uri: Uri) {
+        modelInfo = ModelLibrary.installZip(getApplication<Application>(), uri, displayName(uri), store.modelsDir)
+        updateSettings { it.copy(useImportedModel = true) }
+        stageVersion++
+    }
+
+    fun removeModel() {
+        ModelLibrary.remove(store.modelsDir)
+        modelInfo = null
+        stageVersion++
+    }
+
+    fun useImportedModel(value: Boolean) {
+        updateSettings { it.copy(useImportedModel = value) }
+        stageVersion++
+    }
+
+    // MARK: - Cross-device sync
+
+    fun syncTarget(): Sync.Target = when (store.syncMode) {
+        "webdav" -> {
+            if (store.webdavUrl.isBlank()) throw AppException("请先填写 WebDAV 地址。")
+            Sync.WebDavTarget(store.webdavUrl, store.webdavUser, key("webdav"))
+        }
+        else -> {
+            if (store.syncFolder.isBlank()) throw AppException("请先选择同步文件夹。")
+            Sync.FolderTarget(getApplication<Application>(), Uri.parse(store.syncFolder))
+        }
+    }
+
+    private fun loadArchive(): Sync.Archive = runCatching { Sync.Archive.from(store.syncFile.readBytes()) }.getOrDefault(Sync.Archive())
+
+    suspend fun synchronize(password: String) {
+        if (syncing || pending) throw AppException("请等当前操作完成后再同步。")
+        if (password.length < 8) throw AppException("同步口令至少 8 个字符。")
+        syncing = true
+        try {
+            val target = syncTarget()
+            val device = store.syncDevice
+            val seen = store.syncSeenKeys
+            val snapshot = loadArchive()
+            snapshot.capture(persona, conversation, device, seen)
+            val received = Sync.exchange(target, snapshot, password, device)
+            // Reconcile edits made while the other phones' files were downloading.
+            snapshot.capture(persona, conversation, device, seen)
+            snapshot.merge(received)
+            val (syncedPersona, merged) = snapshot.materialize()
+            withContext(Dispatchers.IO) { store.syncFile.writeBytes(snapshot.bytes()) }
+            store.syncSeenKeys = snapshot.liveKeys()
+            store.lastSyncAt = System.currentTimeMillis()
+            saveConversation(merged.copy(affinity = conversation.affinity, summary = conversation.summary))
+            syncedPersona?.let { adoptSyncedPersona(it) }
+        } finally {
+            syncing = false
+        }
+    }
+
+    /** A persona edited on another phone: reuse a matching preset, otherwise add one, and use it. */
+    private fun adoptSyncedPersona(incoming: PersonaPreset) {
+        val active = persona
+        if (active.profile.trim() == incoming.profile.trim() && active.name.trim() == incoming.name.trim() &&
+            active.greeting.trim() == incoming.greeting.trim()) return
+        val match = presets.firstOrNull { it.profile.trim() == incoming.profile.trim() && it.name.trim() == incoming.name.trim() }
+        if (match != null) {
+            if (match.greeting.trim() != incoming.greeting.trim()) savePreset(match.copy(greeting = incoming.greeting), activate = false)
+            activatePreset(match.id)
+            return
+        }
+        savePreset(incoming.copy(id = newId(), title = "同步 · " + incoming.name.take(20)), activate = true)
     }
 
     fun replay(message: ChatMessage) {

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The DSH bridge runs on your computer in the same Wi-Fi and speaks plain http (http://192.168.x.x:3210).
+     All cloud services (DeepSeek, relays, MiMo, 火山引擎, Breeze, WebDAV) use https. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

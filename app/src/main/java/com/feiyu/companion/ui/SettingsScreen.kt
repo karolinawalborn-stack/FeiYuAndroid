@@ -70,7 +70,7 @@ import com.feiyu.companion.VoiceProvider
 import kotlinx.coroutines.launch
 
 @Composable
-fun SettingsScreen(model: CompanionModel, onBack: () -> Unit, editPreset: (String?) -> Unit) {
+fun SettingsScreen(model: CompanionModel, onBack: () -> Unit, editPreset: (String?) -> Unit, openDsh: () -> Unit, openSync: () -> Unit) {
     val p = LocalPalette.current
     BackHandler(onBack = onBack)
     Box(Modifier.fillMaxSize()) {
@@ -93,9 +93,12 @@ fun SettingsScreen(model: CompanionModel, onBack: () -> Unit, editPreset: (Strin
                     VoiceProvider.MIMO -> MimoVoiceCard(model)
                     else -> CloudVoiceCard(model, model.settings.voiceProvider)
                 }
+                StickerAlbumCard(model)
+                AvatarCard(model)
                 CompanionCard(model)
+                BridgeSyncCard(model, openDsh, openSync)
                 AppearanceCard(model)
-                Text("肥鱼伴侣 Android 0.1.2 · 原画及拆分：神宫凉子 · Live2D 建模：霓虹猫_NeonNeko",
+                Text("肥鱼伴侣 Android 0.2.0 · 原画及拆分：神宫凉子 · Live2D 建模：霓虹猫_NeonNeko",
                     color = p.secondary, fontSize = 11.sp, modifier = Modifier.fillMaxWidth().padding(top = 4.dp))
             }
         }
@@ -166,6 +169,7 @@ private fun TextModelCard(model: CompanionModel) {
             Field("接口地址（Base URL）", settings.relayURL, { v -> model.updateSettings { it.copy(relayURL = v.trim()) } },
                 placeholder = "https://example.com/v1", keyboard = KeyboardType.Uri)
         }
+        var showPictures by remember { mutableStateOf(false) }
         Box {
             Field("模型 ID", settings.model, { v ->
                 model.updateSettings { if (it.provider == TextProvider.DEEPSEEK) it.copy(deepSeekModel = v.trim()) else it.copy(relayModel = v.trim()) }
@@ -209,6 +213,15 @@ private fun TextModelCard(model: CompanionModel) {
             }
         }
         status?.let { StatusView(it) }
+        if (settings.provider == TextProvider.RELAY) {
+            Row(Modifier.fillMaxWidth().clickable { showPictures = !showPictures }.padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("图片相关（可选）", color = p.text, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                Icon(if (showPictures) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown, null, tint = p.secondary)
+            }
+            if (showPictures) PictureModelFields(model)
+        } else {
+            Text("发图片、生成图片需要切换到「自定义中转站」并填写视觉 / 图片模型。", color = p.secondary, fontSize = 12.sp)
+        }
     }
 }
 

@@ -24,6 +24,28 @@ fun JSONArray.strings(): List<String> = (0 until length()).mapNotNull { optStrin
 
 // MARK: - Chat
 
+/** A picture in the chat or in her album. `path` is a file name in the media folder (UUID.jpg). */
+data class MessageImage(
+    val id: String = newId(),
+    val path: String,
+    val width: Int? = null,
+    val height: Int? = null,
+    val altText: String? = null,
+) {
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("id", id); put("path", path)
+        width?.let { put("width", it) }; height?.let { put("height", it) }; altText?.let { put("altText", it) }
+    }
+
+    companion object {
+        fun from(o: JSONObject): MessageImage? {
+            val path = o.str("path") ?: return null
+            return MessageImage(o.str("id") ?: newId(), path,
+                if (o.has("width")) o.optInt("width") else null, if (o.has("height")) o.optInt("height") else null, o.str("altText"))
+        }
+    }
+}
+
 data class ChatMessage(
     val id: String = newId(),
     val role: String,
@@ -31,6 +53,9 @@ data class ChatMessage(
     val emotion: String? = null,
     val audioFile: String? = null,
     val createdAt: Long = System.currentTimeMillis(),
+    val images: List<MessageImage> = emptyList(),
+    val stickerId: String? = null,
+    val audioDuration: Double? = null,
 ) {
     val isUser get() = role == "user"
 
@@ -38,6 +63,9 @@ data class ChatMessage(
         put("id", id); put("role", role); put("text", text); put("createdAt", createdAt)
         emotion?.let { put("emotion", it) }
         audioFile?.let { put("audioFile", it) }
+        audioDuration?.let { put("audioDuration", it) }
+        stickerId?.let { put("stickerID", it) }
+        if (images.isNotEmpty()) put("images", JSONArray(images.map { it.toJson() }))
     }
 
     companion object {
@@ -48,6 +76,9 @@ data class ChatMessage(
             emotion = o.str("emotion"),
             audioFile = o.str("audioFile"),
             createdAt = o.optLong("createdAt", System.currentTimeMillis()),
+            images = o.optJSONArray("images")?.mapObjects { MessageImage.from(it) } ?: emptyList(),
+            stickerId = o.str("stickerID"),
+            audioDuration = if (o.has("audioDuration")) o.optDouble("audioDuration") else null,
         )
     }
 }
@@ -197,6 +228,17 @@ data class AppSettings(
     val volcanoVoice: String = Tts.VOLCANO_DEFAULT,
     val breezeVoice: String = "",
     val theme: AppTheme = AppTheme.NIGHT,
+    /** She may send one sticker every N replies (0 = never). */
+    val stickerEvery: Int = 3,
+    /** Relay vision model used when you send pictures. */
+    val visionModel: String = "",
+    /** Relay image generation model (「生成图片」). */
+    val imageModel: String = "",
+    /** DSH mode: what you type goes to DeepSeek Harness on your computer. */
+    val dshEnabled: Boolean = false,
+    val dshUrl: String = "",
+    /** Use the Live2D model imported in settings instead of 大肥鱼. */
+    val useImportedModel: Boolean = true,
 ) {
     val model get() = if (provider == TextProvider.DEEPSEEK) deepSeekModel else relayModel
     val url get() = if (provider == TextProvider.DEEPSEEK) "https://api.deepseek.com" else relayURL
@@ -213,6 +255,8 @@ data class AppSettings(
         put("voiceProvider", voiceProvider.name); put("mimoVoice", mimoVoice); put("mimoClone", mimoClone)
         mimoSampleId?.let { put("mimoSampleId", it) }
         put("volcanoVoice", volcanoVoice); put("breezeVoice", breezeVoice); put("theme", theme.name)
+        put("stickerEvery", stickerEvery); put("visionModel", visionModel); put("imageModel", imageModel)
+        put("dshEnabled", dshEnabled); put("dshUrl", dshUrl); put("useImportedModel", useImportedModel)
     }
 
     companion object {
@@ -233,6 +277,12 @@ data class AppSettings(
                 volcanoVoice = o.str("volcanoVoice") ?: d.volcanoVoice,
                 breezeVoice = o.optString("breezeVoice"),
                 theme = runCatching { AppTheme.valueOf(o.optString("theme")) }.getOrDefault(d.theme),
+                stickerEvery = o.optInt("stickerEvery", 3).coerceIn(0, 10),
+                visionModel = o.optString("visionModel"),
+                imageModel = o.optString("imageModel"),
+                dshEnabled = o.optBoolean("dshEnabled", false),
+                dshUrl = o.optString("dshUrl"),
+                useImportedModel = o.optBoolean("useImportedModel", true),
             )
         }
     }

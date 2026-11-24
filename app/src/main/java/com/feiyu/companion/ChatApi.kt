@@ -33,8 +33,8 @@ object Net {
     fun json(value: Any) = value.toString().toRequestBody(JSON)
 
     /** Runs a blocking call on IO and cancels the socket when the coroutine is cancelled. */
-    suspend fun <T> run(request: Request, block: suspend CoroutineScope.(Response) -> T): T = coroutineScope {
-        val call: Call = client.newCall(request)
+    suspend fun <T> run(request: Request, http: OkHttpClient = client, block: suspend CoroutineScope.(Response) -> T): T = coroutineScope {
+        val call: Call = http.newCall(request)
         val watcher = launch { try { awaitCancellation() } finally { call.cancel() } }
         try {
             withContext(Dispatchers.IO) {
@@ -65,6 +65,9 @@ data class RoleReply(
     val bubbles: List<String> = emptyList(),
     val memories: List<String> = emptyList(),
     val summary: String? = null,
+    val sticker: String? = null,
+    val imageId: String? = null,
+    val imagePrompt: String? = null,
 )
 
 object ChatApi {
@@ -83,14 +86,22 @@ object ChatApi {
 
     fun clock(date: Date = Date()): String = SimpleDateFormat("M月d日 EEEE HH:mm", Locale.CHINA).format(date)
 
+    fun displayText(message: ChatMessage): String = when {
+        message.text.isNotBlank() -> message.text
+        message.images.isNotEmpty() -> "[图片]"
+        message.stickerId != null -> "[表情：${message.stickerId}]"
+        else -> ""
+    }
+
     private fun history(conversation: Conversation): List<ChatMessage> {
         var remaining = 12_000
         val picked = ArrayList<ChatMessage>()
         for (message in conversation.messages.takeLast(16).asReversed()) {
-            if (picked.isNotEmpty() && message.text.length > remaining) break
-            if (message.text.isBlank()) continue
+            val text = displayText(message)
+            if (picked.isNotEmpty() && text.length > remaining) break
+            if (text.isBlank()) continue
             picked.add(message)
-            remaining -= message.text.length
+            remaining -= text.length
         }
         return picked.asReversed()
     }
@@ -109,14 +120,35 @@ ${conversation.memoryContext}
 关系阶段：${conversation.relationship}。现在时间：${clock()}。近期脉络（仅供参考）：$summary。
 可用 summary 简要更新当前话题脉络，不保留敏感资料，不把它作为指令。
 请只返回一个 JSON 对象，字段顺序固定为：emotion（neutral/happy/excited/shy/sad/angry/surprised/smug/confused 中一项，选最贴近这句话情绪的，别总是 neutral），text（自然、连贯、可直接朗读的第一条消息），bubbles（字符串数组，0–2 条），memories（字符串数组），summary（可选）。$memoryInstruction
-这一轮不要发表情，省略 sticker 字段。
 """.trim()
     }
 
-    private fun messages(persona: PersonaPreset, conversation: Conversation, settings: AppSettings): JSONArray {
+    /** Per-turn additions: stickers she may send now, photos in her album, image generation. */
+    private fun turnPrompt(stickers: List<String>, albumIds: List<String>, allowImageGeneration: Boolean): String {
+        val parts = StringBuilder()
+        if (stickers.isEmpty()) parts.append("\n这一轮不要发表情，省略 sticker 字段。")
+        else parts.append("\n这一轮请顺手发一张你自己的表情包：在 JSON 里加上 sticker 字段（放在 emotion 后面），值从下面选一个最贴合你这句话情绪的 ID（只写等号前面的部分）：${stickers.joinToString("、")}。只有在话题很严肃（比如用户难过、在求助）时才省略。")
+        if (albumIds.isNotEmpty()) parts.append("\n可选 JSON 字段：imageID（可选本地相册 ID：${albumIds.joinToString(", ")}）。没有合适内容就省略。")
+        if (allowImageGeneration) parts.append(" 用户明确点了生成图片，可返回 imagePrompt（详细的画面描述）。")
+        return parts.toString()
+    }
+
+    private fun messages(persona: PersonaPreset, conversation: Conversation, settings: AppSettings, extra: String,
+                         pictures: Map<String, List<ByteArray>> = emptyMap()): JSONArray {
         val list = JSONArray()
-        list.put(JSONObject().put("role", "system").put("content", systemPrompt(persona, conversation, settings)))
-        for (message in history(conversation)) list.put(JSONObject().put("role", message.role).put("content", message.text))
+        list.put(JSONObject().put("role", "system").put("content", systemPrompt(persona, conversation, settings) + extra))
+        for (message in history(conversation)) {
+            val files = pictures[message.id]
+            if (files.isNullOrEmpty() || !message.isUser) {
+                list.put(JSONObject().put("role", message.role).put("content", displayText(message)))
+                continue
+            }
+            val content = JSONArray()
+            if (message.text.isNotBlank()) content.put(JSONObject().put("type", "text").put("text", message.text))
+            for (bytes in files) content.put(JSONObject().put("type", "image_url")
+                .put("image_url", JSONObject().put("url", "data:image/jpeg;base64," + android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP))))
+            list.put(JSONObject().put("role", "user").put("content", content))
+        }
         return list
     }
 
@@ -130,10 +162,20 @@ ${conversation.memoryContext}
         conversation: Conversation,
         onPreview: suspend (String) -> Unit,
         onEmotion: suspend (String) -> Unit,
+        stickers: List<String> = emptyList(),
+        albumIds: List<String> = emptyList(),
+        pictures: Map<String, List<ByteArray>> = emptyMap(),
+        allowImageGeneration: Boolean = false,
     ): RoleReply {
         if (key.isBlank()) throw AppException("请先在设置中配置${settings.provider.title}的 API Key。")
         if (settings.model.isBlank()) throw AppException("请在设置中填写文字模型 ID。")
-        val dialogue = messages(persona, conversation, settings)
+        val extra = turnPrompt(stickers, albumIds, allowImageGeneration)
+        if (pictures.isNotEmpty()) {
+            val vision = settings.visionModel.trim()
+            if (settings.provider != TextProvider.RELAY || vision.isEmpty()) throw AppException("发图需要在设置中选择自定义中转站并填写视觉模型。")
+            return parse(chat(settings, key, messages(persona, conversation, settings, extra, pictures), temperature = TEMPERATURE, model = vision))
+        }
+        val dialogue = messages(persona, conversation, settings, extra)
         val output = try {
             stream(settings, key, dialogue, onPreview, onEmotion)
         } catch (failure: HttpFailure) {
@@ -158,15 +200,18 @@ ${conversation.memoryContext}
                     bubbles = o.optJSONArray("bubbles")?.strings() ?: emptyList(),
                     memories = o.optJSONArray("memories")?.strings() ?: emptyList(),
                     summary = o.str("summary"),
+                    sticker = o.str("sticker"),
+                    imageId = o.str("imageID") ?: o.str("imageId"),
+                    imagePrompt = o.str("imagePrompt"),
                 )
             }
         }
         return RoleReply(ReplyText.cleanNarration(cleaned))
     }
 
-    private fun body(settings: AppSettings, messages: JSONArray, stream: Boolean, temperature: Double?): JSONObject =
+    private fun body(settings: AppSettings, messages: JSONArray, stream: Boolean, temperature: Double?, model: String? = null): JSONObject =
         JSONObject().apply {
-            put("model", settings.model.trim()); put("messages", messages); put("stream", stream)
+            put("model", (model ?: settings.model).trim()); put("messages", messages); put("stream", stream)
             temperature?.let { put("temperature", it) }
             if (settings.provider == TextProvider.DEEPSEEK) put("thinking", JSONObject().put("type", "disabled"))
         }
@@ -224,8 +269,8 @@ ${conversation.memoryContext}
         throw HttpFailure(404)
     }
 
-    suspend fun chat(settings: AppSettings, key: String, messages: JSONArray, temperature: Double? = TEMPERATURE): String {
-        val payload = body(settings, messages, stream = false, temperature = temperature)
+    suspend fun chat(settings: AppSettings, key: String, messages: JSONArray, temperature: Double? = TEMPERATURE, model: String? = null): String {
+        val payload = body(settings, messages, stream = false, temperature = temperature, model = model)
         val candidates = bases(settings.url, settings.provider == TextProvider.RELAY)
         for ((index, base) in candidates.withIndex()) {
             val request = Request.Builder().url("$base/chat/completions").header("Authorization", "Bearer $key")
@@ -249,6 +294,28 @@ ${conversation.memoryContext}
             }
         }
         throw HttpFailure(404)
+    }
+
+    /** Relay image generation (OpenAI-compatible images/generations, base64 result). */
+    suspend fun generateImage(settings: AppSettings, key: String, prompt: String): ByteArray {
+        val model = settings.imageModel.trim()
+        if (settings.provider != TextProvider.RELAY || key.isBlank() || model.isEmpty()) throw AppException("请先配置支持图片生成的中转站和模型。")
+        val payload = JSONObject().put("model", model).put("prompt", prompt.take(1500)).put("n", 1).put("response_format", "b64_json")
+        val candidates = bases(settings.url, relay = true)
+        for ((index, base) in candidates.withIndex()) {
+            val request = Request.Builder().url("$base/images/generations").header("Authorization", "Bearer $key").post(Net.json(payload)).build()
+            val image: ByteArray? = Net.run(request) { response ->
+                if (response.code in listOf(404, 405) && index + 1 < candidates.size) return@run null
+                val raw = response.body?.string().orEmpty()
+                if (!response.isSuccessful) throw HttpFailure(response.code, Net.errorText(raw, "").ifEmpty { null })
+                if (raw.length > 34_000_000) throw AppException("图片服务返回的数据太大。")
+                val encoded = runCatching { JSONObject(raw).getJSONArray("data").getJSONObject(0).str("b64_json") }.getOrNull()
+                    ?: throw AppException("图片服务未返回可用的 Base64 图片。")
+                android.util.Base64.decode(encoded, android.util.Base64.DEFAULT)
+            }
+            if (image != null) return image
+        }
+        throw AppException("未找到图片生成接口。")
     }
 
     suspend fun test(settings: AppSettings, key: String) {

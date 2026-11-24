@@ -149,6 +149,8 @@ sealed interface Screen {
     data object Chat : Screen
     data object Settings : Screen
     data class Persona(val id: String?) : Screen
+    data object Dsh : Screen
+    data object Sync : Screen
 }
 
 @Composable
@@ -157,7 +159,10 @@ fun AppRoot(model: CompanionModel) {
     when (val current = screen) {
         Screen.Room -> RoomScreen(model, openChat = { screen = Screen.Chat }, openSettings = { model.stopVoiceMode(); screen = Screen.Settings })
         Screen.Chat -> ChatScreen(model, onBack = { screen = Screen.Room })
-        Screen.Settings -> SettingsScreen(model, onBack = { model.stopSpeaking(); screen = Screen.Room }, editPreset = { screen = Screen.Persona(it) })
+        Screen.Settings -> SettingsScreen(model, onBack = { model.stopSpeaking(); screen = Screen.Room }, editPreset = { screen = Screen.Persona(it) },
+            openDsh = { screen = Screen.Dsh }, openSync = { screen = Screen.Sync })
         is Screen.Persona -> PersonaEditor(model, current.id, onBack = { screen = Screen.Settings })
+        Screen.Dsh -> DshScreen(model, onBack = { screen = Screen.Settings })
+        Screen.Sync -> SyncScreen(model, onBack = { screen = Screen.Settings })
     }
 }

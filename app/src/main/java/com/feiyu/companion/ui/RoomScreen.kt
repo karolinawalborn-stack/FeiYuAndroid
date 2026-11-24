@@ -130,24 +130,28 @@ fun RoomScreen(model: CompanionModel, openChat: () -> Unit, openSettings: () -> 
     var attempt by remember { mutableIntStateOf(0) }
     val state = avatarState(model, playing)
     val startVoice = rememberMicStarter(model) { model.startVoiceMode() }
+    // First launch: make her sticker pack once, quietly, while she says hello.
+    var autoStickers by remember { mutableStateOf(!model.stickersReady && !model.store.prefs.getBoolean("stickerAutoTried", false)) }
 
     LaunchedEffect(Unit) {
+        if (autoStickers) model.store.prefs.edit().putBoolean("stickerAutoTried", true).apply()
         delay(1_200)
         model.greetIfNeeded()
     }
 
     Box(Modifier.fillMaxSize()) {
         SeaBackdrop()
-        if (stage != StageStatus.READY) {
+        if (stage != StageStatus.READY && model.stageModelFile == null) {
             Image(painterResource(R.drawable.portrait), model.name, contentScale = ContentScale.Fit,
                 modifier = Modifier.fillMaxSize().padding(top = 110.dp, bottom = 170.dp).alpha(if (stage == StageStatus.FAILED) 1f else 0.55f))
         }
-        key(attempt) {
+        key(attempt, model.stageVersion) {
             AvatarStage(
                 mouth = mouth, expression = model.expression, state = state, reaction = model.reaction,
                 topInset = 96f, bottomInset = 168f,
                 onTouch = { model.touch(it) }, onStatus = { stage = it },
                 modifier = Modifier.fillMaxSize(),
+                modelFile = model.stageModelFile,
             )
         }
 
@@ -179,8 +183,11 @@ fun RoomScreen(model: CompanionModel, openChat: () -> Unit, openSettings: () -> 
             }
         }
 
-        Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().navigationBarsPadding().imePadding().padding(14.dp)) {
-            if (model.voiceMode) VoiceDock(model, playing) else TextDock(model, onVoice = startVoice, openSettings = openSettings)
+        Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth().navigationBarsPadding().imePadding().padding(14.dp),
+            horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            if (autoStickers) StickerAutoMaker(model) { autoStickers = false }
+            if (model.voiceMode) VoiceDock(model, playing)
+            else Composer(model, trailingIdle = { CircleButton(Icons.Filled.GraphicEq, "语音对话", null) { startVoice() } })
         }
     }
 }
@@ -208,23 +215,32 @@ fun RoundIcon(icon: ImageVector, description: String, onClick: () -> Unit) {
 @Composable
 private fun SpeechBubble(model: CompanionModel, onClick: () -> Unit) {
     val p = LocalPalette.current
-    val last = model.conversation.messages.lastOrNull()
+    val messages = model.conversation.messages
+    val last = messages.lastOrNull()
+    val muted = model.voiceMode || model.quietTurn
+    val recent = last != null && !last.isUser && System.currentTimeMillis() - last.createdAt < 10 * 60_000L
+    // Her latest turn: up to three bubbles plus a sticker.
+    val turn = if (recent) messages.takeLastWhile { !it.isUser }.takeLast(4) else emptyList()
+    val sticker = if (muted || model.pending) null else turn.lastOrNull { it.stickerId != null }?.let { model.sticker(it.stickerId) }
     val text = when {
         // Voice conversation and touch reactions are heard, not read.
-        model.voiceMode || model.quietTurn -> ""
+        muted -> ""
         model.pending && model.preview.isNotBlank() -> model.preview
         model.pending -> "…"
-        last != null && !last.isUser && System.currentTimeMillis() - last.createdAt < 10 * 60_000L -> last.text
+        recent -> turn.map { it.text }.filter { it.isNotBlank() }.takeLast(3).joinToString("\n")
         else -> ""
     }
-    AnimatedVisibility(text.isNotBlank(), enter = fadeIn(), exit = fadeOut()) {
+    AnimatedVisibility(text.isNotBlank() || sticker != null, enter = fadeIn(), exit = fadeOut()) {
         Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopStart) {
             val shape = RoundedCornerShape(20.dp, 20.dp, 20.dp, 6.dp)
             Box(Modifier.widthIn(max = 330.dp).clip(shape).background(Color.White.copy(alpha = if (p.dark) 0.07f else 0.30f))
                 .border(0.8.dp, androidx.compose.ui.graphics.Brush.linearGradient(listOf(Color.White.copy(alpha = if (p.dark) 0.38f else 0.95f),
                     Color.White.copy(alpha = if (p.dark) 0.06f else 0.35f))), shape)
                 .clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 10.dp)) {
-                Text(text, color = p.text, fontSize = 15.sp, lineHeight = 21.sp, maxLines = 5, overflow = TextOverflow.Ellipsis)
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (text.isNotBlank()) Text(text, color = p.text, fontSize = 15.sp, lineHeight = 21.sp, maxLines = 6, overflow = TextOverflow.Ellipsis)
+                    if (sticker != null) StickerView(model, sticker, 96)
+                }
             }
         }
     }
@@ -242,37 +258,6 @@ fun ErrorBanner(text: String, onSettings: (() -> Unit)? = null, onClose: () -> U
                 modifier = Modifier.clickable(onClick = onSettings).padding(8.dp))
         }
         IconButton(onClick = onClose) { Icon(Icons.Filled.Close, "关闭提示", tint = p.secondary) }
-    }
-}
-
-@Composable
-private fun TextDock(model: CompanionModel, onVoice: () -> Unit, openSettings: () -> Unit) {
-    val p = LocalPalette.current
-    var input by remember { mutableStateOf("") }
-    fun submit() {
-        if (!model.textReady) { model.error = "请先在设置里填写文字模型的 API Key。"; return }
-        if (model.send(input)) input = ""
-    }
-    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(26.dp)).background(p.glass).border(0.8.dp, p.stroke, RoundedCornerShape(26.dp))
-        .padding(6.dp), verticalAlignment = Alignment.CenterVertically) {
-        TextField(
-            value = input, onValueChange = { input = it },
-            placeholder = { Text("和${model.name}说点什么…", color = p.secondary) },
-            maxLines = 4,
-            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-            keyboardActions = KeyboardActions(onSend = { submit() }),
-            colors = TextFieldDefaults.colors(focusedContainerColor = Color.Transparent, unfocusedContainerColor = Color.Transparent,
-                focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent,
-                focusedTextColor = p.text, unfocusedTextColor = p.text, cursorColor = p.accent),
-            modifier = Modifier.weight(1f).onFocusChanged { model.typing = it.isFocused },
-        )
-        if (model.pending) {
-            CircleButton(Icons.Filled.Stop, "停止", p.danger) { model.cancel(); model.stopSpeaking() }
-        } else if (input.isNotBlank()) {
-            CircleButton(Icons.AutoMirrored.Filled.Send, "发送", null) { submit() }
-        } else {
-            CircleButton(Icons.Filled.GraphicEq, "语音对话", null) { onVoice() }
-        }
     }
 }
 
@@ -329,12 +314,8 @@ fun ChatScreen(model: CompanionModel, onBack: () -> Unit) {
     val p = LocalPalette.current
     BackHandler(onBack = onBack)
     val playing by model.player.playing.collectAsState()
-    var input by remember { mutableStateOf("") }
     val dictate = rememberMicStarter(model) { model.listen(sendOnce = true) }
-    fun submit() {
-        if (!model.textReady) { model.error = "请先在设置里填写文字模型的 API Key。"; return }
-        if (model.send(input)) input = ""
-    }
+    var viewing by remember { mutableStateOf<com.feiyu.companion.MessageImage?>(null) }
     Box(Modifier.fillMaxSize()) {
         SeaBackdrop()
         Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().imePadding()) {
@@ -352,41 +333,37 @@ fun ChatScreen(model: CompanionModel, onBack: () -> Unit) {
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 14.dp, vertical = 10.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (model.pending) item("pending") {
-                    Bubble(ChatMessage(id = "preview", role = "assistant", text = model.preview.ifBlank { model.activity.ifEmpty { "…" } }), playable = false) {}
+                    Bubble(model, ChatMessage(id = "preview", role = "assistant", text = model.preview.ifBlank { model.activity.ifEmpty { "…" } }), playable = false, onView = {}) {}
                 }
                 items(messages.asReversed(), key = { it.id }) { message ->
-                    Bubble(message, playable = message.audioFile != null) { model.replay(message) }
+                    Bubble(model, message, playable = message.audioFile != null, onView = { viewing = it }) { model.replay(message) }
                 }
                 if (messages.isEmpty() && !model.pending) item("empty") {
                     Text("还没有聊天记录，跟${model.name}打个招呼吧～", color = p.secondary, fontSize = 14.sp,
                         modifier = Modifier.fillMaxWidth().padding(24.dp))
                 }
             }
-            Row(Modifier.fillMaxWidth().padding(10.dp).clip(RoundedCornerShape(26.dp)).background(p.glass)
-                .border(0.8.dp, p.stroke, RoundedCornerShape(26.dp)).padding(6.dp), verticalAlignment = Alignment.CenterVertically) {
-                IconButton(onClick = { if (model.listener.listening) model.listener.stop() else dictate() }) {
-                    Icon(if (model.listener.listening) Icons.Filled.Stop else Icons.Filled.Mic, "语音输入", tint = p.accent)
-                }
-                TextField(
-                    value = if (model.listener.listening) model.listener.transcript else input,
-                    onValueChange = { input = it },
-                    placeholder = { Text(if (model.listener.listening) "正在听…" else "输入消息", color = p.secondary) },
-                    maxLines = 5,
-                    colors = TextFieldDefaults.colors(focusedContainerColor = Color.Transparent, unfocusedContainerColor = Color.Transparent,
-                        focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent,
-                        focusedTextColor = p.text, unfocusedTextColor = p.text, cursorColor = p.accent),
-                    modifier = Modifier.weight(1f).onFocusChanged { model.typing = it.isFocused },
-                )
-                if (model.pending) CircleButton(Icons.Filled.Stop, "停止", p.danger) { model.cancel(); model.stopSpeaking() }
-                else CircleButton(Icons.AutoMirrored.Filled.Send, "发送", null) { submit() }
+            Box(Modifier.padding(10.dp)) {
+                Composer(model, leading = {
+                    IconButton(onClick = { if (model.listener.listening) model.listener.stop() else dictate() }) {
+                        Icon(if (model.listener.listening) Icons.Filled.Stop else Icons.Filled.Mic, "语音输入", tint = p.accent)
+                    }
+                }, overrideText = if (model.listener.listening) model.listener.transcript else null)
             }
         }
     }
+    viewing?.let { PhotoViewer(model, it) { viewing = null } }
 }
 
 @Composable
-private fun Bubble(message: ChatMessage, playable: Boolean, onPlay: () -> Unit) {
+private fun Bubble(model: CompanionModel, message: ChatMessage, playable: Boolean, onView: (com.feiyu.companion.MessageImage) -> Unit, onPlay: () -> Unit) {
     val p = LocalPalette.current
+    Column(Modifier.fillMaxWidth(), horizontalAlignment = if (message.isUser) Alignment.End else Alignment.Start,
+        verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        if (!message.isUser && message.emotion == "dsh") Text("DSH · 电脑", color = p.secondary, fontSize = 11.sp)
+        message.images.forEach { image -> PhotoThumb(model, image, 150) { onView(image) } }
+        model.sticker(message.stickerId)?.let { StickerView(model, it, 124) }
+        if (message.text.isBlank()) return@Column
     Row(Modifier.fillMaxWidth(), horizontalArrangement = if (message.isUser) Arrangement.End else Arrangement.Start) {
         // Transparent bubble: faint tint, hairline light edge, tighter corner on the speaker's side.
         val shape = if (message.isUser) RoundedCornerShape(20.dp, 20.dp, 6.dp, 20.dp) else RoundedCornerShape(20.dp, 20.dp, 20.dp, 6.dp)
@@ -404,5 +381,6 @@ private fun Bubble(message: ChatMessage, playable: Boolean, onPlay: () -> Unit) 
                 style = androidx.compose.ui.text.TextStyle(shadow = androidx.compose.ui.graphics.Shadow(
                     (if (p.dark) Color.Black else Color.White).copy(alpha = if (p.dark) 0.55f else 0.8f), blurRadius = 4f)))
         }
+    }
     }
 }
