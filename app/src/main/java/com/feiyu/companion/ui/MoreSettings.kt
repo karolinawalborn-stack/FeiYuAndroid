@@ -233,7 +233,7 @@ fun DshScreen(model: CompanionModel, onBack: () -> Unit) {
         }
         if (model.dshSession != null) {
             ActionButton("开始新的 DSH 会话", Icons.Filled.Refresh, prominent = false, modifier = Modifier.fillMaxWidth()) {
-                model.setDshSession(null)
+                model.updateDshSession(null)
                 status = InlineStatus.ok("下一条消息会开始新的 DSH 会话。")
             }
         }

@@ -495,7 +495,7 @@ class CompanionModel(app: Application) : AndroidViewModel(app) {
                     onStatus = { line -> withContext(Dispatchers.Main) { if (requestId == id) activity = line } },
                     onText = { partial -> withContext(Dispatchers.Main) { if (requestId == id) preview = partial } })
                 if (requestId != id) return@launch
-                result.sessionId?.let { setDshSession(it) }
+                result.sessionId?.let { updateDshSession(it) }
                 preview = ""
                 val message = ChatMessage(role = "assistant", text = result.text, emotion = "dsh")
                 saveConversation(conversation.copy(messages = conversation.messages + message))
@@ -528,7 +528,7 @@ class CompanionModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun setDshSession(id: String?) {
+    fun updateDshSession(id: String?) {
         dshSession = id
         store.dshSession = id
     }
